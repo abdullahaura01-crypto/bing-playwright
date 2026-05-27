@@ -6,10 +6,6 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-const FIXED_MODE = 'Image';
-const FIXED_ASPECT_RATIO = '7:4';
-const FIXED_MODEL = 'DALL-E 3';
-
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -47,17 +43,42 @@ app.post('/generate-bing', async (req, res) => {
     context = await browser.newContext();
     const page = await context.newPage();
 
-    await page.goto('https://www.bing.com/images/create/ai-image-generator', {
+    await page.goto('https://www.bing.com/images/create', {
       waitUntil: 'domcontentloaded',
       timeout: 60000
     });
 
+    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {});
+
+    const textarea = page.locator('textarea, input[type="text"]').first();
+    await textarea.waitFor({ timeout: 30000 });
+    await textarea.fill(prompt);
+
+    const createButton = page.getByRole('button', { name: /create|generate/i }).first();
+    await createButton.click();
+
+    await page.waitForLoadState('networkidle', { timeout: 90000 }).catch(() => {});
+    await page.waitForTimeout(10000);
+
+    const firstImage = page.locator('img').nth(0);
+    let imageUrl = await firstImage.getAttribute('src');
+
+    if (!imageUrl || !imageUrl.startsWith('http')) {
+      const firstLink = page.locator('a').nth(0);
+      imageUrl = await firstLink.getAttribute('href');
+    }
+
+    if (!imageUrl || !imageUrl.startsWith('http')) {
+      return res.status(500).json({
+        success: false,
+        error: 'Could not extract imageUrl from Bing results'
+      });
+    }
+
     res.json({
       success: true,
-      promptReceived: prompt,
-      fixedMode: FIXED_MODE,
-      fixedAspectRatio: FIXED_ASPECT_RATIO,
-      fixedModel: FIXED_MODEL
+      imageUrl,
+      promptReceived: prompt
     });
   } catch (error) {
     console.error('generate-bing error:', error);
