@@ -1,4 +1,6 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const { chromium } = require('playwright');
 
 const app = express();
@@ -44,6 +46,14 @@ app.post('/generate-bing', async (req, res) => {
       viewport: { width: 1440, height: 900 }
     });
 
+    const rawCookies = process.env.BING_COOKIES;
+    if (rawCookies) {
+      const cookies = JSON.parse(rawCookies);
+      if (Array.isArray(cookies) && cookies.length > 0) {
+        await context.addCookies(cookies);
+      }
+    }
+
     page = await context.newPage();
     page.setDefaultTimeout(30000);
     page.setDefaultNavigationTimeout(60000);
@@ -52,80 +62,91 @@ app.post('/generate-bing', async (req, res) => {
       waitUntil: 'domcontentloaded'
     });
 
+    await page.waitForTimeout(5000);
     await page.waitForLoadState('networkidle').catch(() => {});
 
-    const dismissButtons = [
+    const title = await page.title();
+    const currentUrl = page.url();
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+
+    const screenshotDir = '/tmp';
+    const screenshotPath = path.join(screenshotDir, 'bing-debug.png');
+    await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+
+    const dismissCandidates = [
       page.getByRole('button', { name: /accept|agree|continue|got it|okay|ok|allow/i }).first(),
-      page.getByRole('button', { name: /sign in later|maybe later|not now|skip/i }).first()
+      page.getByRole('button', { name: /sign in|log in/i }).first(),
+      page.getByRole('button', { name: /skip|not now|maybe later/i }).first()
     ];
 
-    for (const btn of dismissButtons) {
+    for (const btn of dismissCandidates) {
       try {
         if (await btn.isVisible({ timeout: 2000 })) {
           await btn.click();
-          await page.waitForTimeout(1000);
+          await page.waitForTimeout(1500);
         }
       } catch (_) {}
     }
 
-    let promptInput = page.getByRole('textbox').filter({ visible: true }).first();
+    const candidates = [
+      page.getByRole('textbox').first(),
+      page.getByPlaceholder(/describe|create|anything|prompt|image/i).first(),
+      page.locator('textarea:visible').first(),
+      page.locator('input[type="text"]:visible').first()
+    ];
 
-    try {
-      await promptInput.waitFor({ state: 'visible', timeout: 8000 });
-    } catch (_) {
-      const candidates = [
-        page.getByPlaceholder(/describe|create|image|anything/i).first(),
-        page.locator('textarea:visible').first(),
-        page.locator('input[type="text"]:visible').first()
-      ];
+    let promptInput = null;
 
-      let found = false;
-      for (const candidate of candidates) {
-        try {
-          await candidate.waitFor({ state: 'visible', timeout: 5000 });
-          promptInput = candidate;
-          found = true;
-          break;
-        } catch (_) {}
-      }
+    for (const candidate of candidates) {
+      try {
+        await candidate.waitFor({ state: 'visible', timeout: 5000 });
+        promptInput = candidate;
+        break;
+      } catch (_) {}
+    }
 
-      if (!found) {
-        return res.status(500).json({
-          success: false,
-          error: 'Could not find visible Bing prompt input. You may need to confirm the page layout or login state.'
-        });
-      }
+    if (!promptInput) {
+      return res.status(500).json({
+        success: false,
+        error: 'Could not find visible Bing prompt input. Confirm login/cookies and page layout.',
+        debug: {
+          title,
+          currentUrl,
+          bodySnippet: bodyText.slice(0, 1500),
+          hasCookies: !!rawCookies
+        }
+      });
     }
 
     await promptInput.click();
     await promptInput.fill(String(prompt).trim());
 
-    let createButton = page.getByRole('button', { name: /create|generate/i }).first();
+    const buttonCandidates = [
+      page.getByRole('button', { name: /create|generate/i }).first(),
+      page.locator('button:visible').filter({ hasText: /create|generate/i }).first(),
+      page.locator('input[type="submit"]:visible').first()
+    ];
 
-    try {
-      await createButton.waitFor({ state: 'visible', timeout: 8000 });
-    } catch (_) {
-      const fallbackButtons = [
-        page.locator('button:visible').filter({ hasText: /create|generate/i }).first(),
-        page.locator('input[type="submit"]:visible').first()
-      ];
+    let createButton = null;
 
-      let found = false;
-      for (const candidate of fallbackButtons) {
-        try {
-          await candidate.waitFor({ state: 'visible', timeout: 5000 });
-          createButton = candidate;
-          found = true;
-          break;
-        } catch (_) {}
-      }
+    for (const candidate of buttonCandidates) {
+      try {
+        await candidate.waitFor({ state: 'visible', timeout: 5000 });
+        createButton = candidate;
+        break;
+      } catch (_) {}
+    }
 
-      if (!found) {
-        return res.status(500).json({
-          success: false,
-          error: 'Could not find Create/Generate button on Bing.'
-        });
-      }
+    if (!createButton) {
+      return res.status(500).json({
+        success: false,
+        error: 'Could not find visible Create/Generate button.',
+        debug: {
+          title,
+          currentUrl,
+          bodySnippet: bodyText.slice(0, 1500)
+        }
+      });
     }
 
     await createButton.click();
@@ -147,9 +168,8 @@ app.post('/generate-bing', async (req, res) => {
           'icon',
           'favicon',
           'sprite',
-          'bing.com/sa/',
-          'th.bing.com/th/id/ODLS',
-          'r.bing.com'
+          'r.bing.com',
+          'th.bing.com/th/id/odls'
         ];
 
         const isGood = (url) => {
@@ -172,16 +192,17 @@ app.post('/generate-bing', async (req, res) => {
         return Array.from(urls);
       });
 
-      if (imageUrls.length > 0) {
-        break;
-      }
+      if (imageUrls.length > 0) break;
     }
 
     if (!imageUrls.length) {
       return res.status(500).json({
         success: false,
-        error: 'No image URLs found. Bing may still be generating, the selector may need adjustment, or the result may require login/session cookies.',
-        promptReceived: prompt
+        error: 'No image URLs found after waiting.',
+        debug: {
+          finalUrl: page.url(),
+          title: await page.title()
+        }
       });
     }
 
@@ -201,21 +222,15 @@ app.post('/generate-bing', async (req, res) => {
   } finally {
     try {
       if (page) await page.close();
-    } catch (e) {
-      console.error('page close error:', e.message);
-    }
+    } catch (e) {}
 
     try {
       if (context) await context.close();
-    } catch (e) {
-      console.error('context close error:', e.message);
-    }
+    } catch (e) {}
 
     try {
       if (browser) await browser.close();
-    } catch (e) {
-      console.error('browser close error:', e.message);
-    }
+    } catch (e) {}
   }
 });
 
