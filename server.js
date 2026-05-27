@@ -50,35 +50,62 @@ app.post('/generate-bing', async (req, res) => {
 
     await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {});
 
-    const textarea = page.locator('textarea, input[type="text"]').first();
-    await textarea.waitFor({ timeout: 30000 });
-    await textarea.fill(prompt);
+    const promptInput = page.locator('textarea, input[type="text"]').first();
+    await promptInput.waitFor({ state: 'visible', timeout: 30000 });
+    await promptInput.fill(prompt);
 
     const createButton = page.getByRole('button', { name: /create|generate/i }).first();
     await createButton.click();
 
-    await page.waitForLoadState('networkidle', { timeout: 90000 }).catch(() => {});
-    await page.waitForTimeout(10000);
+    await page.waitForTimeout(15000);
 
-    const firstImage = page.locator('img').nth(0);
-    let imageUrl = await firstImage.getAttribute('src');
+    let imageUrls = [];
 
-    if (!imageUrl || !imageUrl.startsWith('http')) {
-      const firstLink = page.locator('a').nth(0);
-      imageUrl = await firstLink.getAttribute('href');
+    for (let i = 0; i < 12; i++) {
+      await page.waitForTimeout(5000);
+
+      imageUrls = await page.evaluate(() => {
+        const urls = new Set();
+
+        document.querySelectorAll('img').forEach((img) => {
+          const src = img.getAttribute('src') || '';
+          if (src.startsWith('http')) urls.add(src);
+        });
+
+        document.querySelectorAll('a').forEach((a) => {
+          const href = a.getAttribute('href') || '';
+          if (href.startsWith('http')) urls.add(href);
+        });
+
+        return Array.from(urls);
+      });
+
+      imageUrls = imageUrls.filter(
+        (url) =>
+          url.startsWith('http') &&
+          !url.includes('logo') &&
+          !url.includes('avatar') &&
+          !url.includes('icon') &&
+          !url.includes('favicon')
+      );
+
+      if (imageUrls.length > 0) {
+        break;
+      }
     }
 
-    if (!imageUrl || !imageUrl.startsWith('http')) {
+    if (!imageUrls.length) {
       return res.status(500).json({
         success: false,
-        error: 'Could not extract imageUrl from Bing results'
+        error: 'No image URLs found yet. Bing may still be generating or selectors may need adjustment.'
       });
     }
 
     res.json({
       success: true,
-      imageUrl,
-      promptReceived: prompt
+      promptReceived: prompt,
+      imageUrl: imageUrls[0],
+      imageUrls
     });
   } catch (error) {
     console.error('generate-bing error:', error);
