@@ -6,6 +6,19 @@ app.use(express.json({ limit: '1mb' }));
 
 const PORT = process.env.PORT || 3000;
 
+function normalizeUrl(url) {
+  if (!url || typeof url !== 'string') return '';
+  return url.trim();
+}
+
+function isGeneratedBingImage(url) {
+  const u = normalizeUrl(url).toLowerCase();
+  return (
+    u.startsWith('https://th.bing.com/th/id/oig') ||
+    u.startsWith('http://th.bing.com/th/id/oig')
+  );
+}
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -111,6 +124,34 @@ app.post('/generate-bing', async (req, res) => {
       });
     }
 
+    const getCurrentOigUrls = async () => {
+      const urls = await page.evaluate(() => {
+        const collected = new Set();
+
+        const isOig = (url) => {
+          if (!url || typeof url !== 'string') return false;
+          const u = url.toLowerCase();
+          return u.startsWith('https://th.bing.com/th/id/oig') || u.startsWith('http://th.bing.com/th/id/oig');
+        };
+
+        document.querySelectorAll('img').forEach((img) => {
+          const src = img.getAttribute('src') || img.src || '';
+          if (isOig(src)) collected.add(src);
+        });
+
+        document.querySelectorAll('a').forEach((a) => {
+          const href = a.getAttribute('href') || a.href || '';
+          if (isOig(href)) collected.add(href);
+        });
+
+        return Array.from(collected);
+      });
+
+      return urls.filter(isGeneratedBingImage);
+    };
+
+    const beforeUrls = await getCurrentOigUrls();
+
     try {
       await promptInput.fill(String(prompt).trim());
     } catch (_) {
@@ -164,57 +205,32 @@ app.post('/generate-bing', async (req, res) => {
     const maxWaitMs = 180000;
     const pollMs = 5000;
     const startTime = Date.now();
-    let imageUrls = [];
+
+    let afterUrls = [];
+    let newUrls = [];
 
     while (Date.now() - startTime < maxWaitMs) {
       await page.waitForTimeout(pollMs);
 
-      imageUrls = await page.evaluate(() => {
-        const urls = new Set();
+      afterUrls = await getCurrentOigUrls();
+      newUrls = afterUrls.filter(url => !beforeUrls.includes(url));
 
-        const badParts = [
-          'logo',
-          'avatar',
-          'icon',
-          'favicon',
-          'sprite',
-          'r.bing.com',
-          'th.bing.com/th/id/odls'
-        ];
-
-        const isGood = (url) => {
-          if (!url || typeof url !== 'string') return false;
-          if (!url.startsWith('http')) return false;
-          const lower = url.toLowerCase();
-          return !badParts.some(part => lower.includes(part));
-        };
-
-        document.querySelectorAll('img').forEach((img) => {
-          const src = img.getAttribute('src') || img.src || '';
-          if (isGood(src)) urls.add(src);
-        });
-
-        document.querySelectorAll('a').forEach((a) => {
-          const href = a.getAttribute('href') || a.href || '';
-          if (isGood(href)) urls.add(href);
-        });
-
-        return Array.from(urls);
-      });
-
-      if (imageUrls.length > 0) {
+      if (newUrls.length > 0) {
         break;
       }
     }
 
-    if (!imageUrls.length) {
+    if (!newUrls.length) {
       return res.status(500).json({
         success: false,
-        error: 'No image URLs found after waiting.',
+        error: 'No new generated image URLs found for the current prompt.',
         debug: {
           title: await page.title().catch(() => ''),
           finalUrl: page.url(),
-          bodySnippet: await page.locator('body').innerText().then(t => t.slice(0, 1500)).catch(() => '')
+          beforeCount: beforeUrls.length,
+          afterCount: afterUrls.length,
+          beforeUrls,
+          afterUrls
         }
       });
     }
@@ -222,8 +238,13 @@ app.post('/generate-bing', async (req, res) => {
     return res.json({
       success: true,
       promptReceived: prompt,
-      imageUrl: imageUrls[0],
-      imageUrls
+      imageUrl: newUrls[0],
+      imageUrls: newUrls,
+      debug: {
+        beforeCount: beforeUrls.length,
+        afterCount: afterUrls.length,
+        newCount: newUrls.length
+      }
     });
   } catch (error) {
     console.error('generate-bing error:', error);
