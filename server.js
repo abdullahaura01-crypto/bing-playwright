@@ -1,10 +1,12 @@
 const express = require('express');
+const crypto = require('crypto');
 const { chromium } = require('playwright');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 const PORT = process.env.PORT || 3000;
+const jobs = {};
 
 function normalizeUrl(url) {
   if (!url || typeof url !== 'string') return '';
@@ -19,28 +21,21 @@ function isGeneratedBingImage(url) {
   );
 }
 
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    message: 'Playwright app is running'
-  });
-});
-
-app.post('/generate-bing', async (req, res) => {
-  const { prompt } = req.body;
-
-  if (!prompt || !String(prompt).trim()) {
-    return res.status(400).json({
-      success: false,
-      error: 'Prompt is required'
-    });
-  }
-
+async function runBingJob(jobId, prompt) {
   let browser;
   let context;
   let page;
 
   try {
+    jobs[jobId] = {
+      status: 'processing',
+      prompt,
+      imageUrl: null,
+      imageUrls: [],
+      error: null,
+      createdAt: new Date().toISOString()
+    };
+
     browser = await chromium.launch({
       headless: true,
       dumpio: true,
@@ -76,10 +71,6 @@ app.post('/generate-bing', async (req, res) => {
     await page.waitForTimeout(5000);
     await page.waitForLoadState('networkidle').catch(() => {});
 
-    const title = await page.title().catch(() => '');
-    const currentUrl = page.url();
-    const bodyText = await page.locator('body').innerText().catch(() => '');
-
     const dismissCandidates = [
       page.getByRole('button', { name: /accept|agree|continue|got it|okay|ok|allow/i }).first(),
       page.getByRole('button', { name: /skip|not now|maybe later/i }).first()
@@ -112,16 +103,7 @@ app.post('/generate-bing', async (req, res) => {
     }
 
     if (!promptInput) {
-      return res.status(500).json({
-        success: false,
-        error: 'Could not find visible Bing prompt input. Confirm login/cookies and page layout.',
-        debug: {
-          title,
-          currentUrl,
-          bodySnippet: bodyText.slice(0, 1500),
-          hasCookies: !!rawCookies
-        }
-      });
+      throw new Error('Could not find visible Bing prompt input');
     }
 
     const getCurrentOigUrls = async () => {
@@ -155,21 +137,8 @@ app.post('/generate-bing', async (req, res) => {
     try {
       await promptInput.fill(String(prompt).trim());
     } catch (_) {
-      try {
-        await promptInput.click({ force: true });
-        await promptInput.fill(String(prompt).trim());
-      } catch (e) {
-        return res.status(500).json({
-          success: false,
-          error: 'Could not type into Bing prompt input.',
-          debug: {
-            title,
-            currentUrl,
-            bodySnippet: bodyText.slice(0, 1500),
-            typingError: e.message
-          }
-        });
-      }
+      await promptInput.click({ force: true });
+      await promptInput.fill(String(prompt).trim());
     }
 
     const buttonCandidates = [
@@ -189,15 +158,7 @@ app.post('/generate-bing', async (req, res) => {
     }
 
     if (!createButton) {
-      return res.status(500).json({
-        success: false,
-        error: 'Could not find visible Create/Generate button.',
-        debug: {
-          title,
-          currentUrl,
-          bodySnippet: bodyText.slice(0, 1500)
-        }
-      });
+      throw new Error('Could not find visible Create/Generate button');
     }
 
     await createButton.click({ force: true });
@@ -221,38 +182,23 @@ app.post('/generate-bing', async (req, res) => {
     }
 
     if (!newUrls.length) {
-      return res.status(500).json({
-        success: false,
-        error: 'No new generated image URLs found for the current prompt.',
-        debug: {
-          title: await page.title().catch(() => ''),
-          finalUrl: page.url(),
-          beforeCount: beforeUrls.length,
-          afterCount: afterUrls.length,
-          beforeUrls,
-          afterUrls
-        }
-      });
+      throw new Error('No new generated image URLs found for the current prompt');
     }
 
-    return res.json({
-      success: true,
-      promptReceived: prompt,
+    jobs[jobId] = {
+      ...jobs[jobId],
+      status: 'done',
       imageUrl: newUrls[0],
       imageUrls: newUrls,
-      debug: {
-        beforeCount: beforeUrls.length,
-        afterCount: afterUrls.length,
-        newCount: newUrls.length
-      }
-    });
+      finishedAt: new Date().toISOString()
+    };
   } catch (error) {
-    console.error('generate-bing error:', error);
-
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    jobs[jobId] = {
+      ...jobs[jobId],
+      status: 'failed',
+      error: error.message,
+      finishedAt: new Date().toISOString()
+    };
   } finally {
     try {
       if (page) await page.close();
@@ -266,6 +212,68 @@ app.post('/generate-bing', async (req, res) => {
       if (browser) await browser.close();
     } catch (_) {}
   }
+}
+
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    message: 'Playwright app is running'
+  });
+});
+
+app.post('/generate-bing', async (req, res) => {
+  const { prompt } = req.body;
+
+  if (!prompt || !String(prompt).trim()) {
+    return res.status(400).json({
+      success: false,
+      error: 'Prompt is required'
+    });
+  }
+
+  const jobId = crypto.randomUUID();
+
+  jobs[jobId] = {
+    status: 'queued',
+    prompt: String(prompt).trim(),
+    imageUrl: null,
+    imageUrls: [],
+    error: null,
+    createdAt: new Date().toISOString()
+  };
+
+  runBingJob(jobId, String(prompt).trim());
+
+  return res.json({
+    success: true,
+    message: 'Job started',
+    jobId,
+    status: 'queued'
+  });
+});
+
+app.get('/job-status/:jobId', (req, res) => {
+  const { jobId } = req.params;
+  const job = jobs[jobId];
+
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      error: 'Job not found'
+    });
+  }
+
+  return res.json({
+    success: true,
+    jobId,
+    status: job.status,
+    prompt: job.prompt,
+    imageUrl: job.imageUrl,
+    imageUrls: job.imageUrls,
+    error: job.error,
+    createdAt: job.createdAt,
+    finishedAt: job.finishedAt || null
+  });
 });
 
 app.listen(PORT, () => {
