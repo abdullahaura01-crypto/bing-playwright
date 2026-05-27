@@ -1,6 +1,4 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
 const { chromium } = require('playwright');
 
 const app = express();
@@ -65,30 +63,25 @@ app.post('/generate-bing', async (req, res) => {
     await page.waitForTimeout(5000);
     await page.waitForLoadState('networkidle').catch(() => {});
 
-    const title = await page.title();
+    const title = await page.title().catch(() => '');
     const currentUrl = page.url();
     const bodyText = await page.locator('body').innerText().catch(() => '');
 
-    const screenshotDir = '/tmp';
-    const screenshotPath = path.join(screenshotDir, 'bing-debug.png');
-    await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
-
     const dismissCandidates = [
       page.getByRole('button', { name: /accept|agree|continue|got it|okay|ok|allow/i }).first(),
-      page.getByRole('button', { name: /sign in|log in/i }).first(),
       page.getByRole('button', { name: /skip|not now|maybe later/i }).first()
     ];
 
     for (const btn of dismissCandidates) {
       try {
         if (await btn.isVisible({ timeout: 2000 })) {
-          await btn.click();
+          await btn.click({ force: true });
           await page.waitForTimeout(1500);
         }
       } catch (_) {}
     }
 
-    const candidates = [
+    const inputCandidates = [
       page.getByRole('textbox').first(),
       page.getByPlaceholder(/describe|create|anything|prompt|image/i).first(),
       page.locator('textarea:visible').first(),
@@ -97,7 +90,7 @@ app.post('/generate-bing', async (req, res) => {
 
     let promptInput = null;
 
-    for (const candidate of candidates) {
+    for (const candidate of inputCandidates) {
       try {
         await candidate.waitFor({ state: 'visible', timeout: 5000 });
         promptInput = candidate;
@@ -118,8 +111,25 @@ app.post('/generate-bing', async (req, res) => {
       });
     }
 
-    await promptInput.click();
-    await promptInput.fill(String(prompt).trim());
+    try {
+      await promptInput.fill(String(prompt).trim());
+    } catch (_) {
+      try {
+        await promptInput.click({ force: true });
+        await promptInput.fill(String(prompt).trim());
+      } catch (e) {
+        return res.status(500).json({
+          success: false,
+          error: 'Could not type into Bing prompt input.',
+          debug: {
+            title,
+            currentUrl,
+            bodySnippet: bodyText.slice(0, 1500),
+            typingError: e.message
+          }
+        });
+      }
+    }
 
     const buttonCandidates = [
       page.getByRole('button', { name: /create|generate/i }).first(),
@@ -149,7 +159,7 @@ app.post('/generate-bing', async (req, res) => {
       });
     }
 
-    await createButton.click();
+    await createButton.click({ force: true });
 
     const maxWaitMs = 180000;
     const pollMs = 5000;
@@ -192,7 +202,9 @@ app.post('/generate-bing', async (req, res) => {
         return Array.from(urls);
       });
 
-      if (imageUrls.length > 0) break;
+      if (imageUrls.length > 0) {
+        break;
+      }
     }
 
     if (!imageUrls.length) {
@@ -200,8 +212,9 @@ app.post('/generate-bing', async (req, res) => {
         success: false,
         error: 'No image URLs found after waiting.',
         debug: {
+          title: await page.title().catch(() => ''),
           finalUrl: page.url(),
-          title: await page.title()
+          bodySnippet: await page.locator('body').innerText().then(t => t.slice(0, 1500)).catch(() => '')
         }
       });
     }
@@ -222,15 +235,15 @@ app.post('/generate-bing', async (req, res) => {
   } finally {
     try {
       if (page) await page.close();
-    } catch (e) {}
+    } catch (_) {}
 
     try {
       if (context) await context.close();
-    } catch (e) {}
+    } catch (_) {}
 
     try {
       if (browser) await browser.close();
-    } catch (e) {}
+    } catch (_) {}
   }
 });
 
